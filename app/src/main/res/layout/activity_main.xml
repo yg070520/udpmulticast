@@ -102,6 +102,12 @@
             android:layout_height="wrap_content"
             android:text="强制走 Wi-Fi 网络(多网络并存时勾选)" />
 
+        <CheckBox
+            android:id="@+id/cbListen"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="监听组播地址和端口(收到的消息显示在下方日志)" />
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
