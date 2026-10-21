@@ -4,9 +4,12 @@ import android.app.Activity
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.Editable
+import android.text.TextWatcher
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -14,6 +17,7 @@ import android.widget.TextView
 import java.net.DatagramPacket
 import java.net.InetAddress
 import java.net.MulticastSocket
+import java.net.SocketTimeoutException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -31,8 +35,13 @@ class MainActivity : Activity() {
     private lateinit var etInterval: EditText
     private lateinit var etMessage: EditText
     private lateinit var cbWifi: CheckBox
+    private lateinit var cbListen: CheckBox
     private lateinit var btnLoop: Button
     private lateinit var tvLog: TextView
+
+    @Volatile private var listenSocket: MulticastSocket? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var listenThread: Thread? = null
 
     private var looping = false
     private var counter = 0
@@ -56,8 +65,22 @@ class MainActivity : Activity() {
         etInterval = findViewById(R.id.etInterval)
         etMessage = findViewById(R.id.etMessage)
         cbWifi = findViewById(R.id.cbWifi)
+        cbListen = findViewById(R.id.cbListen)
         btnLoop = findViewById(R.id.btnLoop)
         tvLog = findViewById(R.id.tvLog)
+
+        cbListen.setOnCheckedChangeListener { _, checked ->
+            if (checked) startListening() else stopListening()
+        }
+        val uncheckOnChange = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                if (cbListen.isChecked) cbListen.isChecked = false
+            }
+        }
+        etGroup.addTextChangedListener(uncheckOnChange)
+        etPort.addTextChangedListener(uncheckOnChange)
 
         findViewById<Button>(R.id.btnSend).setOnClickListener { sendOnce(appendCounter = false) }
 
@@ -75,8 +98,83 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         stopLoop()
+        stopListening()
         executor.shutdown()
         super.onDestroy()
+    }
+
+    private fun startListening() {
+        val groupStr = etGroup.text.toString().trim()
+        val port = etPort.text.toString().toIntOrNull()
+        val useWifi = cbWifi.isChecked
+        if (port == null || port !in 1..65535) {
+            log("端口无效")
+            cbListen.isChecked = false
+            return
+        }
+        val group = try {
+            InetAddress.getByName(groupStr).also { require(it.isMulticastAddress) }
+        } catch (e: Exception) {
+            log("监听失败: $groupStr 不是有效的组播地址")
+            cbListen.isChecked = false
+            return
+        }
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        multicastLock = wm?.createMulticastLock("udpmulticast")?.apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        val t = Thread {
+            var socket: MulticastSocket? = null
+            try {
+                socket = MulticastSocket(port)
+                if (useWifi) {
+                    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                    @Suppress("DEPRECATION")
+                    val wifi = cm.allNetworks.firstOrNull { n ->
+                        cm.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                    } ?: throw IllegalStateException("未找到 Wi-Fi 网络")
+                    wifi.bindSocket(socket)
+                }
+                @Suppress("DEPRECATION")
+                socket.joinGroup(group)
+                socket.soTimeout = 500
+                listenSocket = socket
+                log("开始监听 $groupStr:$port")
+                val buf = ByteArray(65535)
+                while (listenSocket === socket) {
+                    val packet = DatagramPacket(buf, buf.size)
+                    try {
+                        socket.receive(packet)
+                    } catch (e: SocketTimeoutException) {
+                        continue
+                    }
+                    val msg = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                    log("已接收 <- ${packet.address.hostAddress}:${packet.port} ($groupStr:$port): $msg")
+                }
+            } catch (e: Exception) {
+                if (listenSocket === socket || socket == null || listenSocket == null) {
+                    log("监听失败: ${e.javaClass.simpleName}: ${e.message}")
+                    runOnUiThread { cbListen.isChecked = false }
+                }
+            } finally {
+                try { socket?.close() } catch (_: Exception) {}
+            }
+        }
+        listenThread = t
+        t.start()
+    }
+
+    private fun stopListening() {
+        val s = listenSocket
+        listenSocket = null
+        if (s != null) {
+            try { s.close() } catch (_: Exception) {}
+            log("已停止监听")
+        }
+        multicastLock?.let { if (it.isHeld) it.release() }
+        multicastLock = null
+        listenThread = null
     }
 
     private fun stopLoop() {
